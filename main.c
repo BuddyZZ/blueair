@@ -1,55 +1,113 @@
-// main.c
 #include <stdio.h>
 #include <unistd.h>
-#include "sensor_core.h"
-#include "sensor_filter.h"
+#include "temp_sensor_driver.h"
+#include "temp_sensor_framework.h"
+#include "app_logic.h"
 
-extern const sensor_ops_t g_temp_sensor_ops;
-extern void gui_on_temp_update(const sensor_event_t *event, void *user_data);
-extern void mqtt_on_temp_update(const sensor_event_t *event, void *user_data);
-extern void logic_on_temp_update(const sensor_event_t *event, void *user_data);
+/* ============================================================================
+ * 1. Driver 层：具体硬件驱动实现示例 (以 SHT30 传感器为例)
+ * ============================================================================ */
+static int sht30_hardware_init(void) {
+    printf("[Driver] SHT30 I2C Hardware Init OK.\n");
+    return 0;
+}
 
+static int sht30_read_raw_data(int32_t *raw_temp) {
+    // 模拟从硬件 I2C 寄存器读取到的原始数据 (例如代表 26.5 ℃ 的原始刻度)
+    *raw_temp = 2650; 
+    return 0;
+}
+
+// 绑定底层驱动的操作函数句柄
+static temp_sensor_drv_ops_t g_sht30_drv_ops = {
+    .init = sht30_hardware_init,
+    .config = NULL,
+    .read_raw = sht30_read_raw_data,
+    .write_reg = NULL,
+    .deinit = NULL
+};
+
+/* ============================================================================
+ * 2. Framework 层扩展：具体滤波器策略实现示例 (以 滑动平均滤波 为例)
+ * ============================================================================ */
+typedef struct {
+    float buffer[4];
+    uint8_t index;
+} moving_avg_ctx_t;
+
+static void* moving_avg_init(void *config) {
+    static moving_avg_ctx_t ctx = {0};
+    return &ctx;
+}
+
+static float moving_avg_process(void *ctx, float new_val) {
+    moving_avg_ctx_t *m_ctx = (moving_avg_ctx_t*)ctx;
+    m_ctx->buffer[m_ctx->index] = new_val;
+    m_ctx->index = (m_ctx->index + 1) % 4;
+
+    float sum = 0;
+    for (int i = 0; i < 4; i++) {
+        sum += m_ctx->buffer[i];
+    }
+    return sum / 4.0f; // 返回均值
+}
+
+// 绑定滤波器算法接口
+static sensor_filter_ops_t g_moving_avg_filter_ops = {
+    .init = moving_avg_init,
+    .process = moving_avg_process,
+    .deinit = NULL
+};
+
+/* ============================================================================
+ * 3. App 层：各独立业务的回调实现 (解耦，互不干扰)
+ * ============================================================================ */
+void app_gui_update_cb(float temp, void *user_data) {
+    printf("[App - GUI]  刷新UI界面显示温度: %.2f ℃\n", temp);
+}
+
+void app_mqtt_publish_cb(float temp, void *user_data) {
+    printf("[App - MQTT] 推送 JSON 数据包至 MQTT Broker, Temp: %.2f\n", temp);
+}
+
+void app_business_calc_cb(float temp, void *user_data) {
+    if (temp > 30.0f) {
+        printf("[App - CALC] 警告：温度过高! 触发风扇启动逻辑...\n");
+    } else {
+        printf("[App - CALC] 温度正常，维持运行.\n");
+    }
+}
+
+/* ============================================================================
+ * 4. 系统初始化与主运行入口 (系统组装)
+ * ============================================================================ */
 int main(void) {
-    printf("=== IoT Cross-Platform Sensor Framework Demo ===\n\n");
+    // A. 创建传感器设备实例并绑定驱动
+    temp_sensor_dev_t sht30_dev = {
+        .name = "SHT30_Room_Sensor",
+        .drv_ops = &g_sht30_drv_ops
+    };
 
-    // 1. 准备 MCU 相关的硬件配置结构体
-    struct { uint8_t bus; uint8_t addr; } stm32_hw = { .bus = 1, .addr = 0x48 };
+    // B. 注册并初始化传感器
+    sensor_fw_register_device(&sht30_dev);
+    sensor_fw_init(&sht30_dev);
 
-    // 2. 实例化并注册温度传感器
-    sensor_dev_t temp_sensor;
-    sensor_register(&temp_sensor, "Room_Temp", SENSOR_TYPE_TEMP, &g_temp_sensor_ops, &stm32_hw);
+    // C. 动态挂载滤波算法 (此处挂载滑动平均滤波，也可随时替换为卡尔曼滤波)
+    sensor_fw_set_filter(&sht30_dev, &g_moving_avg_filter_ops, NULL);
 
-    // 3. 灵活挂载滤波模式 (三选一，可随时切换)
-    // 方案 A: 卡尔曼滤波
-    filter_t *kalman = filter_kalman_create(0.01f, 0.25f, 1.0f, 25.0f);
-    sensor_set_filter(&temp_sensor, kalman);
+    // D. App 层模块各自向框架订阅数据关注 (观察者模式解耦)
+    sensor_fw_subscribe(&sht30_dev, app_gui_update_cb, NULL);
+    sensor_fw_subscribe(&sht30_dev, app_mqtt_publish_cb, NULL);
+    sensor_fw_subscribe(&sht30_dev, app_business_calc_cb, NULL);
 
-    /* 方案 B: 一阶低通 (若改用低通，解开注释即可)
-    filter_t *lowpass = filter_lowpass_create(0.2f);
-    sensor_set_filter(&temp_sensor, lowpass);
-    */
+    printf("\n=== 传感器系统启动完成，开始采集轮询 ===\n\n");
 
-    /* 方案 C: 滑动平均 (5点滑动)
-    filter_t *moving_avg = filter_moving_avg_create(5);
-    sensor_set_filter(&temp_sensor, moving_avg);
-    */
-
-    // 4. 绑定应用层订阅（完成 GUI、MQTT 和业务计算的解耦）
-    alarm_ctx_t alarm_cfg = { .threshold = 25.4f };
-
-    sensor_subscribe(&temp_sensor, gui_on_temp_update, NULL);
-    sensor_subscribe(&temp_sensor, mqtt_on_temp_update, (void *)"Client_ESP32");
-    sensor_subscribe(&temp_sensor, logic_on_temp_update, &alarm_cfg);
-
-    // 5. 模拟 MCU 主循环调度采样 (Poll)
-    printf("\n--- Starting Sensor Sampling Engine Loop ---\n");
-    for (int i = 0; i < 5; i++) {
-        printf("\n--- Tick %d ---\n", i + 1);
-        sensor_poll(&temp_sensor, i * 1000);
-        usleep(500000); // 延时 500ms
+    // E. 业务主循环/定时器任务
+    for (int i = 0; i < 3; i++) {
+        // 框架统一触发采样、滤波并通知所有订阅的 App 业务
+        sensor_fw_poll_and_notify(&sht30_dev);
+        sleep(1);
     }
 
-    // 资源释放
-    filter_destroy(kalman);
     return 0;
 }

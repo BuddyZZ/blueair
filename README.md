@@ -12,6 +12,8 @@
 整体分三层app层用于执行业务，framwork层用于解耦app和driver，driver为底层固件驱动。
 - app 调用framwork层接口，执行GUI、MQTT、业务计算等操作。除非业务逻辑有变更，此层基本不需要改变。
 - framwork 将driver层init 等函数打包，返回执行app层操作或返回特定接口格式的数据。此层对外接口基本不变，根据硬件不同修改接口函数内部逻辑。
+  - 考虑使用函数指针或回调函数减少app修改
+  - 多进程访问可能需要加锁保护
 - driver 寄存器操作，支持 init config read write等硬件操作。此层依据硬件变化较大。
 
  
